@@ -11,7 +11,7 @@
 #include <curand.h>
 #include <curand_kernel.h>
 
-#define THREADS_PER_BLOCK 128
+#define THREADS_PER_BLOCK 64
 
 using namespace Eigen;
 
@@ -143,7 +143,7 @@ int ParallelGaussSeidel(SparseMatrix<float>& A, VectorXf& o_x, VectorXf& b, int 
 	return iter;
 }
 
-__global__ void ColorInit(int *nodePalettes, int *nextColor, int *neighbours, int shrinkFactor, int stride, int n)
+__global__ void ColorInit(int *nodePalettes, int *nextColor, int *neighbours, bool *isColored, int shrinkFactor, int stride, int n)
 {
 	int i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i < n)
@@ -151,6 +151,7 @@ __global__ void ColorInit(int *nodePalettes, int *nextColor, int *neighbours, in
 		int maxColor = (int)(neighbours[stride * i] / shrinkFactor);
 		if (maxColor == 0) maxColor = 1;
 		nextColor[i] = maxColor;
+		isColored[i] = false;
 		int starter = i * stride;
 		nodePalettes[starter] = 0;
 		for (int c = 0; c < maxColor; c++)
@@ -208,8 +209,9 @@ __global__ void TentativeColoring(int *nodeColor, int *nodePalettes, int *U, cur
 	}
 }
 
-__global__ void ResolveConflict(int *neighbours, int *nodeColor, int *nodePalettes, int *U, int stride, int USize)
+__global__ void ResolveConflict(int *neighbours, int *nodeColor, int *nodePalettes, bool *isColored, int *U, int stride, int USize)
 {
+	
 	int tid = threadIdx.x + blockIdx.x * blockDim.x;
 	if (tid < USize)
 	{
@@ -229,7 +231,7 @@ __global__ void ResolveConflict(int *neighbours, int *nodeColor, int *nodePalett
 			{
 				legalNode = false;
 			}
-			if (sid < nid)
+			if (sid < nid && isColored[nid] == false)
 			{
 				localMax = false;
 			}
@@ -252,6 +254,7 @@ __global__ void ResolveConflict(int *neighbours, int *nodeColor, int *nodePalett
 					}
 				}
 			}
+			isColored[sid] = true;
 			U[tid] = -1;
 		}
 	}
@@ -318,6 +321,7 @@ int* GraphColoring(SparseMatrix<float> &A, int &o_numParitions, std::vector<int>
 	//generate neigbour array
 	int *neighbours;
 	int stride = maxDegree + 1;
+	std::cout << "Max degree: " << maxDegree << std::endl;
 	{	
 		neighbours = (int *)malloc(n * stride * sizeof(int));
 		for (int i = 0; i < n; i++) neighbours[i * stride] = 0;
@@ -350,8 +354,10 @@ int* GraphColoring(SparseMatrix<float> &A, int &o_numParitions, std::vector<int>
 	cudaMalloc((void**)&d_nodePalettes, n * stride * sizeof(int));
 	int *d_nextColor;//next color that will be used for each node once all existing ones are consumed
 	cudaMalloc((void**)&d_nextColor, n * sizeof(int));
+	bool *d_isColored;
+	cudaMalloc((void**)&d_isColored, n * sizeof(bool));
 	int shrinkFactor = minDegree + 1;
-	ColorInit <<< (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK >>>(d_nodePalettes, d_nextColor, d_neighbours, shrinkFactor, stride, n);
+	ColorInit <<< (n + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK >>>(d_nodePalettes, d_nextColor, d_neighbours, d_isColored, shrinkFactor, stride, n);
 
 	//U
 	int USize = n;
@@ -390,22 +396,17 @@ int* GraphColoring(SparseMatrix<float> &A, int &o_numParitions, std::vector<int>
 		bool noProgress = false;
 		{
 			clock_t t = clock();
-			ResolveConflict << < (USize + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK >> > (d_neighbours, d_nodeColor, d_nodePalettes, d_U, stride, USize);
+			ResolveConflict << < (USize + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, THREADS_PER_BLOCK >> > (d_neighbours, d_nodeColor, d_nodePalettes, d_isColored, d_U, stride, USize);
 			cudaDeviceSynchronize();
 			cudaMemcpy(U, d_U, USize * sizeof(int), cudaMemcpyDeviceToHost);
-			
+		
 			int newUSize = 0;
-			std::vector<int> removed;
 			for (int i = 0; i < USize; i++)
 			{
 				if (U[i] != -1)
 				{
 					tempU[newUSize] = U[i];
 					newUSize++;
-				}
-				else 
-				{
-					removed.push_back(i);
 				}
 			}
 			//swap U and tempU
@@ -473,6 +474,7 @@ int* GraphColoring(SparseMatrix<float> &A, int &o_numParitions, std::vector<int>
 	cudaFree(d_nodePalettes);
 	cudaFree(d_nextColor);
 	cudaFree(d_U);
+	cudaFree(d_isColored);
 	cudaFree(states);
 
 	free(nodeColor);
@@ -575,7 +577,7 @@ int main()
 	MatrixGenerator(M);
 	SparseMatrix<float> M_sparse = M.sparseView();
 	std::cout << "Matrix generated..." << std::endl << std::endl;
-	//std::cout << M << std::endl;
+	std::cout << "CLOCKS_PER_SEC: " << CLOCKS_PER_SEC << std::endl;
 
 	VectorXf expectedSolution(n);
 	for (int i = 0; i < n; i++)
@@ -591,6 +593,7 @@ int main()
 	//regular GS
 	x.setZero();
 	clock_t t = clock();
+	
 	SparseMatrix<float, RowMajor> Mr_sparse(M_sparse);
 	int iter1 = GaussSeidel(Mr_sparse, x, b);
 	//Eigen::SimplicialCholesky<SparseMatrix<float>> chol(M_sparse);
@@ -614,6 +617,7 @@ int main()
 	t = clock() - t;
 	
 	std::cout << x(0) << ", " << x(1) << ", " << "... " << x(n - 2) << ", " << x(n - 1) << std::endl;
+	//std::cout << x << std::endl;
 	std::cout << "GS iterations: " << iter2 << std::endl;
 	std::cout << "Elapsed time: " << t << std::endl;
 	
